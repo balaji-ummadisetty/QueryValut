@@ -1,0 +1,172 @@
+version: '3.8'
+
+# ---------------------------------------------------------------------------
+# QueryVault ETL Pipeline
+# ---------------------------------------------------------------------------
+# Services:
+#   airflow-db   – PostgreSQL for Airflow's internal metadata (separate from app DB)
+#   chromadb     – Vector store that receives the embedded queries
+#   airflow-init – One-shot container that initialises Airflow DB and creates admin user
+#   airflow-web  – Airflow webserver  (http://localhost:8081)
+#   airflow-sch  – Airflow scheduler  (runs the DAGs)
+#
+# The SOURCE_DB_URL env var points at the existing QueryVault PostgreSQL instance
+# (the one managed by ../postgres/docker-compose.yaml).
+# ---------------------------------------------------------------------------
+
+x-airflow-common: &airflow-common
+  build:
+    context: ../../etl_pipeline
+    dockerfile: Dockerfile
+  environment:
+    # Airflow core
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+
+    # Make config/ and tasks/ importable from the DAG
+    PYTHONPATH: /opt/airflow
+
+    # HuggingFace cache — must be writable by the airflow user
+    HF_HOME: /opt/airflow/hf_cache
+
+    # Airflow metadata database (internal, not the app DB)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+
+    # QueryVault source database  ← update this if your app DB is on another host
+    SOURCE_DB_URL: ${SOURCE_DB_URL:-postgresql://balaji:balajiU%4012@host.docker.internal:5433/queryValut}
+
+    # ChromaDB
+    CHROMA_HOST: chromadb
+    CHROMA_PORT: "8000"
+    CHROMA_COLLECTION: ${CHROMA_COLLECTION:-query_vault_queries}
+
+    # Embedding
+    EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-huggingface}
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+    # ETL tuning
+    ETL_DEFAULT_START_DATE: ${ETL_DEFAULT_START_DATE:-2020-01-01T00:00:00}
+    UPSERT_BATCH_SIZE: ${UPSERT_BATCH_SIZE:-100}
+
+    # Airflow admin credentials (used by airflow-init)
+    _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_USER:-admin}
+    _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_PASSWORD:-admin}
+
+  volumes:
+    # Bind-mount source code for live editing without rebuilding the image
+    - ../../etl_pipeline/dags:/opt/airflow/dags
+    - ../../etl_pipeline/tasks:/opt/airflow/tasks
+    - ../../etl_pipeline/config:/opt/airflow/config
+    # Persistent Airflow logs
+    - airflow_logs:/opt/airflow/logs
+    # HuggingFace model cache — avoids re-downloading on every restart
+    - hf_cache:/opt/airflow/hf_cache
+
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    chromadb:
+      condition: service_started
+
+  # Allow containers to reach host.docker.internal (the app's PostgreSQL)
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+  restart: unless-stopped
+
+
+services:
+  # -------------------------------------------------------------------------
+  # Airflow metadata database
+  # -------------------------------------------------------------------------
+  airflow-db:
+    image: postgres:17
+    container_name: etl-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # ChromaDB vector store
+  # -------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: etl-chromadb
+    environment:
+      CHROMA_SERVER_HOST: "0.0.0.0"
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Airflow – one-shot initialiser
+  # -------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: etl-airflow-init
+    command:
+      - bash
+      - -c
+      - |
+          airflow db migrate &&
+          (airflow users create \
+            --username "$${_AIRFLOW_WWW_USER_USERNAME}" \
+            --password "$${_AIRFLOW_WWW_USER_PASSWORD}" \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email admin@example.com || true)
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Airflow – webserver
+  # -------------------------------------------------------------------------
+  airflow-web:
+    <<: *airflow-common
+    container_name: etl-airflow-web
+    command: airflow webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      chromadb:
+        condition: service_started
+
+  # -------------------------------------------------------------------------
+  # Airflow – scheduler
+  # -------------------------------------------------------------------------
+  airflow-sch:
+    <<: *airflow-common
+    container_name: etl-airflow-scheduler
+    command: airflow scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      chromadb:
+        condition: service_started
+
+
+volumes:
+  airflow_db_data:
+  airflow_logs:
+  chroma_data:
+  hf_cache:
